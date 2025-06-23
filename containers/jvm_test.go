@@ -1,5 +1,4 @@
 package containers
-package containers
 
 import (
 	"os"
