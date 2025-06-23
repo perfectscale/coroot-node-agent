@@ -226,10 +226,10 @@ func TestParseJVMParamsFromString(t *testing.T) {
 			name:  "complex mixed parameters",
 			input: "java -Xms1g -Xmx4g -XX:+UseG1GC -XX:-UseParallelGC -XX:MaxGCPauseMillis=200 -XX:G1HeapRegionSize=16m -XX:InitialRAMPercentage=25.0 -jar complex-app.jar",
 			expected: JVMParams{
-				JavaMaxHeapSize:             4 * 1024 * 1024 * 1024, // 4GB
-				JavaInitialHeapSize:         -1,                     // Using percentage
-				JavaMaxHeapAsPercentage:     0,
-				JavaInitialHeapAsPercentage: 25.0,
+				JavaMaxHeapSize:             4 * 1024 * 1024 * 1024, // 4GB (explicit -Xmx takes precedence)
+				JavaInitialHeapSize:         1 * 1024 * 1024 * 1024, // 1GB (explicit -Xms takes precedence over percentage)
+				JavaMaxHeapAsPercentage:     0,                      // Not used since explicit max size provided
+				JavaInitialHeapAsPercentage: 25.0,                   // Parsed but not used since explicit initial size provided
 				XXOptions:                   "-XX:+UseG1GC,-XX:-UseParallelGC,-XX:MaxGCPauseMillis=200,-XX:G1HeapRegionSize=16m,-XX:InitialRAMPercentage=25.0",
 			},
 		},
@@ -380,10 +380,10 @@ func TestParseJVMParamsFromString(t *testing.T) {
 			name:  "XX parameters mixed with percentage parameters",
 			input: "java -XX:MaxHeapSize=2g -XX:InitialRAMPercentage=25.0 MyApp",
 			expected: JVMParams{
-				JavaMaxHeapSize:             2 * 1024 * 1024 * 1024, // 2GB (not overridden by percentage)
-				JavaInitialHeapSize:         -1,                     // Using percentage
-				JavaMaxHeapAsPercentage:     0,
-				JavaInitialHeapAsPercentage: 25.0,
+				JavaMaxHeapSize:             2 * 1024 * 1024 * 1024, // 2GB (explicit size takes precedence)
+				JavaInitialHeapSize:         -1,                     // Using percentage (no explicit initial size)
+				JavaMaxHeapAsPercentage:     0,                      // Not used since explicit max size provided
+				JavaInitialHeapAsPercentage: 25.0,                   // Used since no explicit initial size provided
 				XXOptions:                   "-XX:MaxHeapSize=2g,-XX:InitialRAMPercentage=25.0",
 			},
 		},

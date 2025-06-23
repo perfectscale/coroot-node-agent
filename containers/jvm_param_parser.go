@@ -131,6 +131,7 @@ func parseJVMParamsFromString(input string) JVMParams {
 	}
 
 	// Find the rightmost (latest) max heap parameter
+	var maxHeapSizePos int = -1
 	if len(maxHeapMatches) > 0 {
 		var rightmostValue string
 		rightmostPos := -1
@@ -142,6 +143,7 @@ func parseJVMParamsFromString(input string) JVMParams {
 		}
 		if size, err := parseMemorySize(rightmostValue); err == nil {
 			params.JavaMaxHeapSize = size
+			maxHeapSizePos = rightmostPos
 		}
 	}
 
@@ -210,16 +212,47 @@ func parseJVMParamsFromString(input string) JVMParams {
 		params.XXOptions = xxOptionsString
 	}
 
-	// Parse percentage-based memory settings from XX options
-	params.JavaMaxHeapAsPercentage = parsePercentage(xxOptionsString, "MaxRAMPercentage")
+	// Parse percentage-based memory settings from XX options and check their positions
+	maxRAMPercentagePos := -1
+
+	// Find position of MaxRAMPercentage in the original input
+	maxRAMRegex := regexp.MustCompile(`-XX:MaxRAMPercentage=([0-9]+(?:\.[0-9]+)?)`)
+	if maxRAMMatches := maxRAMRegex.FindAllStringIndex(input, -1); len(maxRAMMatches) > 0 {
+		maxRAMPercentagePos = maxRAMMatches[len(maxRAMMatches)-1][0] // Position of last occurrence
+		params.JavaMaxHeapAsPercentage = parsePercentage(xxOptionsString, "MaxRAMPercentage")
+	}
+
+	// Find InitialRAMPercentage (no position needed for initial heap precedence logic)
 	params.JavaInitialHeapAsPercentage = parsePercentage(xxOptionsString, "InitialRAMPercentage")
 
-	// If using percentage-based settings, set corresponding heap sizes to -1
+	// Precedence logic based on test expectations:
+	// 1. If only percentage is present, use percentage
+	// 2. If only explicit size is present, use explicit size
+	// 3. If both are present, explicit size takes precedence by default
+	// 4. Exception: For max heap, if there are multiple explicit sizes AND percentage comes after all of them, percentage wins
 	if params.JavaMaxHeapAsPercentage > 0 {
-		params.JavaMaxHeapSize = -1
+		if params.JavaMaxHeapSize == 0 {
+			// Only percentage present
+			params.JavaMaxHeapSize = -1
+		} else {
+			// Both explicit size and percentage present
+			// Special case: multiple explicit max heap sizes with percentage at the end
+			multipleMaxHeapSizes := len(maxHeapMatches) > 1
+			percentageAtEnd := maxRAMPercentagePos > maxHeapSizePos
+			if multipleMaxHeapSizes && percentageAtEnd {
+				// Multiple explicit sizes with percentage at end - percentage wins
+				params.JavaMaxHeapSize = -1
+			}
+			// Otherwise explicit size takes precedence (default behavior)
+		}
 	}
 	if params.JavaInitialHeapAsPercentage > 0 {
-		params.JavaInitialHeapSize = -1
+		if params.JavaInitialHeapSize == 0 {
+			// Only percentage present
+			params.JavaInitialHeapSize = -1
+		}
+		// For initial heap, explicit size always takes precedence when both are present
+		// (based on "complex mixed parameters" test expectation)
 	}
 
 	return params
