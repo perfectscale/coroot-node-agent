@@ -360,7 +360,10 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 		switch {
 		case proc.IsJvm(cmdline):
-			jvm, jMetrics := jvmMetrics(pid)
+			// Parse JVM parameters from command line and environment variables
+			cmdlineStr := string(cmdline)
+			jvmParams := parseJVMParams(cmdlineStr, pid)
+			jvm, jMetrics := jvmMetrics(pid, jvmParams)
 			if len(jMetrics) > 0 && !seenJvms[jvm] {
 				seenJvms[jvm] = true
 				for _, m := range jMetrics {
