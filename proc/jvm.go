@@ -1,8 +1,6 @@
 package proc
 
-import (
-	"bytes"
-)
+import "bytes"
 
 func IsJvm(cmdline []byte) bool {
 	idx := bytes.Index(cmdline, []byte{0})
