@@ -365,7 +365,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			cmdlineStr := strings.ReplaceAll(string(cmdline), "\x00", " ")
 			cmdlineStr = strings.TrimSpace(cmdlineStr)
 
-			jvmParams := parseJVMParams(cmdlineStr, pid)
+			jvmParams := ParseJVMParams(cmdlineStr, pid)
 			jvm, jMetrics := jvmMetrics(pid, jvmParams)
 			if len(jMetrics) > 0 && !seenJvms[jvm] {
 				seenJvms[jvm] = true
