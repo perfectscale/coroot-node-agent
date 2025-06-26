@@ -38,10 +38,10 @@ func jvmMetrics(pid uint32, jvmParams JVMParams) (string, []prometheus.Metric) {
 	var res []prometheus.Metric
 
 	res = append(res, gauge(metrics.JvmInfo, 1, jvm, pd.getString("java.property.java.version"),
-		fmt.Sprintf("%.0f", jvmParams.JavaMaxHeapSize),
-		fmt.Sprintf("%.0f", jvmParams.JavaInitialHeapSize),
-		fmt.Sprintf("%.2f", jvmParams.JavaMaxHeapAsPercentage),
-		fmt.Sprintf("%.2f", jvmParams.JavaInitialHeapAsPercentage),
+		jvmParams.JavaMaxHeapSize,
+		jvmParams.JavaInitialHeapSize,
+		jvmParams.JavaMaxHeapAsPercentage,
+		jvmParams.JavaInitialHeapAsPercentage,
 		jvmParams.GCType))
 
 	func() {

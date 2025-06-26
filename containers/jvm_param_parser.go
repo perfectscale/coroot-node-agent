@@ -3,51 +3,17 @@ package containers
 import (
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/coroot/coroot-node-agent/jvm"
 )
 
 type JVMParams struct {
-	JavaMaxHeapSize             float64 // in bytes, -1 if using percentage
-	JavaInitialHeapSize         float64 // in bytes, -1 if using percentage
-	JavaMaxHeapAsPercentage     float64 // percentage value, 0 if not set
-	JavaInitialHeapAsPercentage float64 // percentage value, 0 if not set
-	GCType                      string  // garbage collector type (e.g., G1GC, SerialGC, ParallelGC, etc.)
-}
-
-// parseMemorySize converts memory size strings like "2g", "512m", "1024" to bytes
-func parseMemorySize(sizeStr string) (float64, error) {
-	if sizeStr == "" {
-		return 0, fmt.Errorf("empty size string")
-	}
-
-	// Extract numeric part and unit
-	re := regexp.MustCompile(`^(\d+(?:\.\d+)?)([kmgKMG]?)$`)
-	matches := re.FindStringSubmatch(sizeStr)
-	if len(matches) != 3 {
-		return 0, fmt.Errorf("invalid memory size format: %s", sizeStr)
-	}
-
-	value, err := strconv.ParseFloat(matches[1], 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid numeric value: %s", matches[1])
-	}
-
-	unit := strings.ToLower(matches[2])
-	switch unit {
-	case "k":
-		return value * 1024, nil
-	case "m":
-		return value * 1024 * 1024, nil
-	case "g":
-		return value * 1024 * 1024 * 1024, nil
-	case "":
-		return value, nil // bytes
-	default:
-		return 0, fmt.Errorf("unknown memory unit: %s", unit)
-	}
+	JavaMaxHeapSize             string // heap size as string (e.g., "1073741824")
+	JavaInitialHeapSize         string // heap size as string (e.g., "268435456")
+	JavaMaxHeapAsPercentage     string // percentage value as string (e.g., "75.0")
+	JavaInitialHeapAsPercentage string // percentage value as string (e.g., "25.0")
+	GCType                      string // garbage collector type (e.g., G1GC, SerialGC, ParallelGC, etc.)
 }
 
 func ParseJVMParams(cmdline string, pid uint32) JVMParams {
@@ -132,39 +98,23 @@ func parseVMFlagsOutput(vmFlagsOutput string) JVMParams {
 			// Parse specific flags we care about
 			if strings.Contains(flag, "MaxHeapSize=") {
 				if value := extractFlagValue(flag, "MaxHeapSize"); value != "" {
-					if size, err := strconv.ParseFloat(value, 64); err == nil {
-						params.JavaMaxHeapSize = size
-					}
+					params.JavaMaxHeapSize = value
 				}
 			} else if strings.Contains(flag, "MinHeapSize=") {
 				if value := extractFlagValue(flag, "MinHeapSize"); value != "" {
-					if size, err := strconv.ParseFloat(value, 64); err == nil {
-						params.JavaInitialHeapSize = size
-					}
+					params.JavaInitialHeapSize = value
 				}
 			} else if strings.Contains(flag, "InitialHeapSize=") {
 				if value := extractFlagValue(flag, "InitialHeapSize"); value != "" {
-					if size, err := strconv.ParseFloat(value, 64); err == nil {
-						params.JavaInitialHeapSize = size
-					}
+					params.JavaInitialHeapSize = value
 				}
 			} else if strings.Contains(flag, "MaxRAMPercentage=") {
 				if value := extractFlagValue(flag, "MaxRAMPercentage"); value != "" {
-					if percentage, err := strconv.ParseFloat(value, 64); err == nil {
-						params.JavaMaxHeapAsPercentage = percentage
-						if params.JavaMaxHeapSize == 0 {
-							params.JavaMaxHeapSize = -1 // Use percentage
-						}
-					}
+					params.JavaMaxHeapAsPercentage = value
 				}
 			} else if strings.Contains(flag, "InitialRAMPercentage=") {
 				if value := extractFlagValue(flag, "InitialRAMPercentage"); value != "" {
-					if percentage, err := strconv.ParseFloat(value, 64); err == nil {
-						params.JavaInitialHeapAsPercentage = percentage
-						if params.JavaInitialHeapSize == 0 {
-							params.JavaInitialHeapSize = -1 // Use percentage
-						}
-					}
+					params.JavaInitialHeapAsPercentage = value
 				}
 			}
 		}
