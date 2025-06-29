@@ -54,15 +54,15 @@ The coroot-node-agent monitors JVM applications by:
 
 ## Compatibility Matrix
 
-| JVM Implementation | Version | VM.flags | System Properties | GC Detection | Heap Detection | Status |
-|-------------------|---------|----------|-------------------|--------------|----------------|--------|
-| Oracle HotSpot    | 8+      | ✅       | ✅                | ✅           | ✅             | Full   |
-| OpenJDK HotSpot   | 8+      | ✅       | ✅                | ✅           | ✅             | Full   |
-| GraalVM           | 19+     | ✅       | ✅                | ✅           | ✅             | Full   |
-| Eclipse OpenJ9    | 0.8+    | ⚠️       | ✅                | ⚠️           | ⚠️             | Limited|
-| IBM J9            | 8+      | ⚠️       | ✅                | ⚠️           | ⚠️             | Limited|
-| Oracle HotSpot    | 6-7     | ❌       | ❌                | ⚠️           | ⚠️             | Minimal|
-| Azul Zing         | Any     | ❌       | ❌                | ❌           | ❌             | None   |
+| JVM Implementation | Version | Year | VM.flags | System Properties | GC Detection | Heap Detection | Status |
+|-------------------|---------|------|----------|-------------------|--------------|----------------|--------|
+| Oracle HotSpot    | 8+      | 2014+ | ✅       | ✅                | ✅           | ✅             | Full   |
+| OpenJDK HotSpot   | 8+      | 2014+ | ✅       | ✅                | ✅           | ✅             | Full   |
+| GraalVM           | 19+     | 2019+ | ✅       | ✅                | ✅           | ✅             | Full   |
+| Eclipse OpenJ9    | 0.8+    | 2017+ | ⚠️       | ✅                | ⚠️           | ⚠️             | Limited|
+| IBM J9            | Any     | ~2000 | ⚠️       | ✅                | ⚠️           | ⚠️             | Limited|
+| Oracle HotSpot    | 6-7     | 2006-2011 | ❌       | ❌                | ⚠️           | ⚠️             | Minimal|
+| Azul Zing         | Any     | 2010+ | ❌       | ❌                | ❌           | ❌             | None   |
 
 ## Feature Detection
 
