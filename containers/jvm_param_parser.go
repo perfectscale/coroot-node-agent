@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/coroot/coroot-node-agent/jvm"
+	"k8s.io/klog/v2"
 )
 
 type JVMParams struct {
@@ -20,11 +21,15 @@ func ParseJVMParams(cmdline string, pid uint32) JVMParams {
 	// Get VM flags directly from the running JVM
 	vmFlags, err := jvm.GetVMFlags(pid)
 	if err != nil {
-		// Return empty params if we can't get VM flags
-		return JVMParams{}
+		klog.Warningf("Failed to get VM flags for PID %d (only HotSpot JVMs supported): %v", pid, err)
+		return JVMParams{GCType: "Unknown"}
 	}
 
-	// Parse VM flags output
+	if strings.TrimSpace(vmFlags) == "" {
+		klog.Warningf("Empty VM flags output for PID %d", pid)
+		return JVMParams{GCType: "Unknown"}
+	}
+
 	return parseVMFlagsOutput(vmFlags)
 }
 
