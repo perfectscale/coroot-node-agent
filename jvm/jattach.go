@@ -102,14 +102,68 @@ func (jvm *JVM) GetVMFlags() (string, error) {
 	if status[0] != '0' {
 		return "", errors.New("status:" + string(status))
 	}
-	
+
 	// Read the VM flags output
 	buffer := make([]byte, 32*1024) // 32KB buffer should be enough for VM flags
 	n, err := jvm.conn.Read(buffer)
 	if err != nil {
 		return "", err
 	}
-	
+
+	return string(buffer[:n]), nil
+}
+
+func (jvm *JVM) GetSystemProperties() (string, error) {
+	if err := jvm.conn.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
+		return "", err
+	}
+	defer jvm.conn.SetDeadline(time.Time{})
+	msg := strings.Join([]string{"1", "jcmd", "VM.system_properties", "", "", ""}, "\x00")
+	if _, err := jvm.conn.Write([]byte(msg)); err != nil {
+		return "", err
+	}
+	status := []byte{0}
+	if _, err := jvm.conn.Read(status); err != nil {
+		return "", err
+	}
+	if status[0] != '0' {
+		return "", errors.New("status:" + string(status))
+	}
+
+	// Read the system properties output
+	buffer := make([]byte, 32*1024) // 32KB buffer should be enough for system properties
+	n, err := jvm.conn.Read(buffer)
+	if err != nil {
+		return "", err
+	}
+
+	return string(buffer[:n]), nil
+}
+
+func (jvm *JVM) GetVersion() (string, error) {
+	if err := jvm.conn.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
+		return "", err
+	}
+	defer jvm.conn.SetDeadline(time.Time{})
+	msg := strings.Join([]string{"1", "jcmd", "VM.version", "", "", ""}, "\x00")
+	if _, err := jvm.conn.Write([]byte(msg)); err != nil {
+		return "", err
+	}
+	status := []byte{0}
+	if _, err := jvm.conn.Read(status); err != nil {
+		return "", err
+	}
+	if status[0] != '0' {
+		return "", errors.New("status:" + string(status))
+	}
+
+	// Read the version output
+	buffer := make([]byte, 4*1024) // 4KB buffer should be enough for version info
+	n, err := jvm.conn.Read(buffer)
+	if err != nil {
+		return "", err
+	}
+
 	return string(buffer[:n]), nil
 }
 
