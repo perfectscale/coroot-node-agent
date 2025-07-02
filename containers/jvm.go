@@ -42,6 +42,7 @@ func jvmMetrics(pid uint32, jvmParams JVMParams) (string, []prometheus.Metric) {
 		jvmParams.JavaInitialHeapSize,
 		jvmParams.JavaMaxHeapAsPercentage,
 		jvmParams.JavaInitialHeapAsPercentage,
+		jvmParams.MinRAMPercentage,
 		jvmParams.GCType))
 
 	func() {
