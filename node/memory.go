@@ -9,7 +9,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func memoryInfo(procRoot string) (MemoryStat, error) {
+func MemoryInfo(procRoot string) (MemoryStat, error) {
 	mem := MemoryStat{}
 
 	data, err := ioutil.ReadFile(path.Join(procRoot, "meminfo"))

@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -267,6 +268,40 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	if c.oomKills > 0 {
 		ch <- counter(metrics.OOMKills, float64(c.oomKills))
+
+		// Collect detailed OOM metrics with context
+		for _, oomCtx := range c.registry.oomContextCollector.GetRecentOOMs() {
+			if oomCtx.ContainerName == c.metadata.name || oomCtx.ContainerName == string(c.id) {
+				processName := oomCtx.ProcessName
+				if processName == "" {
+					processName = "unknown"
+				}
+
+				memoryPressure := GetMemoryPressureCategory(oomCtx.MemoryPressure)
+				nodeMemUsage := fmt.Sprintf("%.1f%%", oomCtx.NodeMemoryUsage)
+
+				var containerMemUsage string
+				if oomCtx.ContainerMemLimit > 0 {
+					usagePercent := float64(oomCtx.ContainerMemUsage) / float64(oomCtx.ContainerMemLimit) * 100
+					containerMemUsage = GetMemoryUsageCategory(usagePercent)
+				} else {
+					// When no explicit limit is set, categorize based on absolute memory usage
+					// Convert bytes to MB for easier categorization
+					usageMB := float64(oomCtx.ContainerMemUsage) / (1024 * 1024)
+					if usageMB < 100 {
+						containerMemUsage = "low"
+					} else if usageMB < 500 {
+						containerMemUsage = "medium"
+					} else if usageMB < 1024 {
+						containerMemUsage = "high"
+					} else {
+						containerMemUsage = "critical"
+					}
+				}
+
+				ch <- counter(metrics.OOMKillsInfo, 1, processName, memoryPressure, nodeMemUsage, containerMemUsage)
+			}
+		}
 	}
 
 	if disks, err := node.GetDisks(); err == nil {
@@ -451,7 +486,7 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 	return p
 }
 
-func (c *Container) onProcessExit(pid uint32, oomKill bool) {
+func (c *Container) onProcessExit(pid uint32, oomKill bool, processComm string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if p := c.processes[pid]; p != nil {
@@ -464,6 +499,25 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	delete(c.delaysByPid, pid)
 	if oomKill {
 		c.oomKills++
+
+		// Record OOM context for detailed metrics
+		processName := "unknown"
+		if processComm != "" {
+			processName = processComm
+		}
+
+		containerName := c.metadata.name
+		if containerName == "" {
+			containerName = string(c.id)
+		}
+
+		var containerMemLimit, containerMemUsage uint64
+		if memStat := c.cgroup.MemoryStat(); memStat != nil {
+			containerMemLimit = memStat.Limit
+			containerMemUsage = memStat.RSS
+		}
+
+		c.registry.oomContextCollector.RecordOOM(pid, containerName, processName, containerMemLimit, containerMemUsage)
 	}
 }
 

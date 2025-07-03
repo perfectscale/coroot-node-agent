@@ -5,6 +5,7 @@ struct proc_event {
     __u32 type;
     __u32 pid;
     __u32 reason;
+    char comm[TASK_COMM_LEN];
 };
 
 struct {
@@ -64,6 +65,7 @@ int sched_process_exit(struct trace_event_raw_sched_process_template__stub *args
         .type = EVENT_TYPE_PROCESS_EXIT,
         .pid = args->pid,
     };
+    __builtin_memcpy(e.comm, args->comm, TASK_COMM_LEN);
     if (bpf_map_lookup_elem(&oom_info, &e.pid)) {
         e.reason = EVENT_REASON_OOM_KILL;
         bpf_map_delete_elem(&oom_info, &e.pid);

@@ -58,6 +58,7 @@ type Event struct {
 	Type          EventType
 	Reason        EventReason
 	Pid           uint32
+	Comm          string
 	SrcAddr       netaddr.IPPort
 	DstAddr       netaddr.IPPort
 	ActualDstAddr netaddr.IPPort
@@ -318,6 +319,7 @@ type procEvent struct {
 	Type   EventType
 	Pid    uint32
 	Reason uint32
+	Comm   [16]byte
 }
 
 type tcpEvent struct {
@@ -419,7 +421,9 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				klog.Warningln("failed to read msg:", err)
 				continue
 			}
-			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
+			// Extract command name from null-terminated byte array
+			comm := string(bytes.TrimRight(v.Comm[:], "\x00"))
+			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid, Comm: comm}
 		case perfMapTypeTCPEvents:
 			v := &tcpEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {

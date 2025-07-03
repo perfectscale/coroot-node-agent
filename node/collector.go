@@ -211,7 +211,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- gauge(cpuLogicalCoresDesc, float64(cpu.LogicalCores))
 	}
 
-	mem, err := memoryInfo(procRoot)
+	mem, err := MemoryInfo(procRoot)
 	if err != nil {
 		if !common.IsNotExist(err) {
 			klog.Errorln(err)
@@ -259,6 +259,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		c.instanceMetadata.Region, c.instanceMetadata.AvailabilityZone, c.instanceMetadata.AvailabilityZoneId,
 		c.instanceMetadata.LocalIPv4, c.instanceMetadata.PublicIPv4,
 	)
+
 }
 
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {

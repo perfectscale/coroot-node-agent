@@ -62,6 +62,8 @@ type Registry struct {
 	trafficStatsUpdateCh    chan *TrafficStatsUpdate
 
 	gpuProcessUsageSampleChan chan gpu.ProcessUsageSample
+
+	oomContextCollector *OOMContextCollector
 }
 
 func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample) (*Registry, error) {
@@ -118,6 +120,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 		trafficStatsUpdateCh: make(chan *TrafficStatsUpdate),
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
+
+		oomContextCollector: NewOOMContextCollector("/proc"),
 	}
 	if err = reg.Register(r); err != nil {
 		return nil, err
@@ -161,13 +165,13 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if err != nil {
 					delete(r.containersByPid, pid)
 					if c != nil {
-						c.onProcessExit(pid, false)
+						c.onProcessExit(pid, false, "")
 					}
 					continue
 				}
 				if c != nil && cg.Id != c.cgroup.Id {
 					delete(r.containersByPid, pid)
-					c.onProcessExit(pid, false)
+					c.onProcessExit(pid, false, "")
 				}
 			}
 			r.containersByPidIgnored = map[uint32]*time.Time{}
@@ -230,7 +234,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					cg, err := proc.ReadCgroup(e.Pid)
 					if err != nil || cg.Id != c.cgroup.Id {
 						delete(r.containersByPid, e.Pid)
-						c.onProcessExit(e.Pid, false)
+						c.onProcessExit(e.Pid, false, "")
 					}
 				}
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
@@ -241,7 +245,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			case ebpftracer.EventTypeProcessExit:
 				if c := r.containersByPid[e.Pid]; c != nil {
-					c.onProcessExit(e.Pid, e.Reason == ebpftracer.EventReasonOOMKill)
+					c.onProcessExit(e.Pid, e.Reason == ebpftracer.EventReasonOOMKill, e.Comm)
 				}
 				delete(r.containersByPid, e.Pid)
 

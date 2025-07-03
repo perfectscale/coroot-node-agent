@@ -7,7 +7,7 @@ import (
 )
 
 func TestNode_memory(t *testing.T) {
-	m, err := memoryInfo("fixtures/proc")
+	m, err := MemoryInfo("fixtures/proc")
 	assert.Nil(t, err)
 	assert.Equal(t,
 		MemoryStat{
