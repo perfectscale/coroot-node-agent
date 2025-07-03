@@ -3,7 +3,6 @@ package containers
 import (
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/coroot/coroot-node-agent/jvm"
@@ -88,13 +87,6 @@ func parseGCType(flags []string) string {
 }
 
 // parseVMFlagsOutput parses the output from jcmd VM.flags command
-//
-// Precedence rules for RAM parameters:
-// - When both percentage and fraction parameters are present, percentage always takes precedence
-// - MaxRAMPercentage takes precedence over MaxRAMFraction
-// - InitialRAMPercentage takes precedence over InitialRAMFraction
-// - MinRAMPercentage takes precedence over MinRAMFraction
-// - This behavior is consistent with JVM behavior where -XX:MaxRAMPercentage effectively ignores -XX:MaxRAMFraction
 func parseVMFlagsOutput(vmFlagsOutput string) JVMParams {
 	params := JVMParams{}
 
@@ -133,36 +125,6 @@ func parseVMFlagsOutput(vmFlagsOutput string) JVMParams {
 			} else if strings.Contains(flag, "MinRAMPercentage=") {
 				if value := extractFlagValue(flag, "MinRAMPercentage"); value != "" {
 					params.MinRAMPercentage = value
-				}
-			} else if strings.Contains(flag, "MaxRAMFraction=") {
-				// Convert fraction to percentage if percentage not already set
-				// NOTE: MaxRAMPercentage takes precedence over MaxRAMFraction when both exist
-				if params.JavaMaxHeapAsPercentage == "" {
-					if value := extractFlagValue(flag, "MaxRAMFraction"); value != "" {
-						if fraction, err := strconv.ParseFloat(value, 64); err == nil && fraction > 0 {
-							params.JavaMaxHeapAsPercentage = fmt.Sprintf("%.1f", 100.0/fraction)
-						}
-					}
-				}
-			} else if strings.Contains(flag, "InitialRAMFraction=") {
-				// Convert fraction to percentage if percentage not already set
-				// NOTE: InitialRAMPercentage takes precedence over InitialRAMFraction when both exist
-				if params.JavaInitialHeapAsPercentage == "" {
-					if value := extractFlagValue(flag, "InitialRAMFraction"); value != "" {
-						if fraction, err := strconv.ParseFloat(value, 64); err == nil && fraction > 0 {
-							params.JavaInitialHeapAsPercentage = fmt.Sprintf("%.1f", 100.0/fraction)
-						}
-					}
-				}
-			} else if strings.Contains(flag, "MinRAMFraction=") {
-				// Convert fraction to percentage if percentage not already set
-				// NOTE: MinRAMPercentage takes precedence over MinRAMFraction when both exist
-				if params.MinRAMPercentage == "" {
-					if value := extractFlagValue(flag, "MinRAMFraction"); value != "" {
-						if fraction, err := strconv.ParseFloat(value, 64); err == nil && fraction > 0 {
-							params.MinRAMPercentage = fmt.Sprintf("%.1f", 100.0/fraction)
-						}
-					}
 				}
 			}
 		}
