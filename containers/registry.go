@@ -40,6 +40,7 @@ type ProcessInfo struct {
 	Pid         uint32
 	ContainerId ContainerID
 	StartedAt   time.Time
+	Flags       proc.Flags
 }
 
 type Registry struct {
@@ -57,9 +58,11 @@ type Registry struct {
 
 	processInfoCh chan<- ProcessInfo
 
-	trafficStatsLastUpdated time.Time
-	trafficStatsLock        sync.Mutex
-	trafficStatsUpdateCh    chan *TrafficStatsUpdate
+	ebpfStatsLastUpdated time.Time
+	ebpfStatsLock        sync.Mutex
+	trafficStatsUpdateCh chan *TrafficStatsUpdate
+	nodejsStatsUpdateCh  chan *NodejsStatsUpdate
+	pythonStatsUpdateCh  chan *PythonStatsUpdate
 
 	gpuProcessUsageSampleChan chan gpu.ProcessUsageSample
 }
@@ -116,6 +119,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 		tracer: ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing),
 
 		trafficStatsUpdateCh: make(chan *TrafficStatsUpdate),
+		nodejsStatsUpdateCh:  make(chan *NodejsStatsUpdate),
+		pythonStatsUpdateCh:  make(chan *PythonStatsUpdate),
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
 	}
@@ -210,6 +215,20 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			if c := r.containersByPid[u.Pid]; c != nil {
 				c.updateTrafficStats(u)
 			}
+		case u := <-r.nodejsStatsUpdateCh:
+			if u == nil {
+				continue
+			}
+			if c := r.containersByPid[u.Pid]; c != nil {
+				c.updateNodejsStats(*u)
+			}
+		case u := <-r.pythonStatsUpdateCh:
+			if u == nil {
+				continue
+			}
+			if c := r.containersByPid[u.Pid]; c != nil {
+				c.updatePythonStats(*u)
+			}
 		case sample := <-r.gpuProcessUsageSampleChan:
 			if c := r.containersByPid[sample.Pid]; c != nil {
 				if p := c.processes[sample.Pid]; p != nil {
@@ -236,7 +255,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					p := c.onProcessStart(e.Pid)
 					if r.processInfoCh != nil && p != nil {
-						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt}
+						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
 					}
 				}
 			case ebpftracer.EventTypeProcessExit:
@@ -265,14 +284,10 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
 					c.attachTlsUprobes(r.tracer, e.Pid)
-				} else {
-					klog.Infoln("TCP connection from unknown container", e)
 				}
 			case ebpftracer.EventTypeConnectionError:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
-				} else {
-					klog.Infoln("TCP connection error from unknown container", e)
 				}
 			case ebpftracer.EventTypeConnectionClose:
 				if c := r.containersByPid[e.Pid]; c != nil {
@@ -296,10 +311,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					}
 					r.ip2fqdnLock.Unlock()
 				}
-			case ebpftracer.EventTypePythonThreadLock:
-				if c := r.containersByPid[e.Pid]; c != nil {
-					c.pythonThreadLockWaitTime += e.Duration
-				}
 			}
 		}
 	}
@@ -322,6 +333,9 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		if !common.IsNotExist(err) {
 			klog.Warningln("failed to read proc cgroup:", err)
 		}
+		return nil
+	}
+	if strings.HasSuffix(cg.Id, "(deleted)") {
 		return nil
 	}
 	if c := r.containersByCgroupId[cg.Id]; c != nil {
@@ -362,6 +376,14 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containersByPidIgnored[pid] = &t
 		return nil
 	}
+	if cg.ContainerType == cgroup.ContainerTypeSystemdService && *flags.SkipSystemdSystemServices {
+		if md.systemd.IsSystemService() {
+			klog.InfoS("skipping system service", "id", id, "unit", md.systemd.Unit, "type", md.systemd.Type, "triggered_by", md.systemd.TriggeredBy, "pid", pid)
+			t := time.Now()
+			r.containersByPidIgnored[pid] = &t
+			return nil
+		}
+	}
 
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
@@ -390,13 +412,22 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	return c
 }
 
-func (r *Registry) updateTrafficStatsIfNecessary() {
-	r.trafficStatsLock.Lock()
-	defer r.trafficStatsLock.Unlock()
+func (r *Registry) updateStatsFromEbpfMapsIfNecessary() {
+	r.ebpfStatsLock.Lock()
+	defer r.ebpfStatsLock.Unlock()
 
-	if time.Now().Sub(r.trafficStatsLastUpdated) < MinTrafficStatsUpdateInterval {
+	if time.Now().Sub(r.ebpfStatsLastUpdated) < MinTrafficStatsUpdateInterval {
 		return
 	}
+
+	r.updateTrafficStats()
+	r.updateNodejsStats()
+	r.updatePythonStats()
+
+	r.ebpfStatsLastUpdated = time.Now()
+}
+
+func (r *Registry) updateTrafficStats() {
 	iter := r.tracer.ActiveConnectionsIterator()
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
@@ -412,7 +443,36 @@ func (r *Registry) updateTrafficStatsIfNecessary() {
 		klog.Warningln(err)
 	}
 	r.trafficStatsUpdateCh <- nil
-	r.trafficStatsLastUpdated = time.Now()
+}
+
+func (r *Registry) updateNodejsStats() {
+	iter := r.tracer.NodejsStatsIterator()
+	var pid uint64
+	stats := ebpftracer.NodejsStats{}
+
+	for iter.Next(&pid, &stats) {
+		r.nodejsStatsUpdateCh <- &NodejsStatsUpdate{Pid: uint32(pid), Stats: stats}
+	}
+
+	if err := iter.Err(); err != nil {
+		klog.Warningln(err)
+	}
+	r.nodejsStatsUpdateCh <- nil
+}
+
+func (r *Registry) updatePythonStats() {
+	iter := r.tracer.PythonStatsIterator()
+	var pid uint64
+	stats := ebpftracer.PythonStats{}
+
+	for iter.Next(&pid, &stats) {
+		r.pythonStatsUpdateCh <- &PythonStatsUpdate{Pid: uint32(pid), Stats: stats}
+	}
+
+	if err := iter.Err(); err != nil {
+		klog.Warningln(err)
+	}
+	r.pythonStatsUpdateCh <- nil
 }
 
 func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
@@ -488,9 +548,10 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 func getContainerMetadata(cg *cgroup.Cgroup) (*ContainerMetadata, error) {
 	switch cg.ContainerType {
 	case cgroup.ContainerTypeSystemdService:
+		var err error
 		md := &ContainerMetadata{}
-		md.systemdTriggeredBy = SystemdTriggeredBy(cg.ContainerId)
-		return md, nil
+		md.systemd, err = getSystemdProperties(cg.Id)
+		return md, err
 	case cgroup.ContainerTypeDocker, cgroup.ContainerTypeContainerd, cgroup.ContainerTypeSandbox, cgroup.ContainerTypeCrio:
 	default:
 		return &ContainerMetadata{}, nil
@@ -525,4 +586,14 @@ type TrafficStatsUpdate struct {
 	FD            uint64
 	BytesSent     uint64
 	BytesReceived uint64
+}
+
+type NodejsStatsUpdate struct {
+	Pid   uint32
+	Stats ebpftracer.NodejsStats
+}
+
+type PythonStatsUpdate struct {
+	Pid   uint32
+	Stats ebpftracer.PythonStats
 }

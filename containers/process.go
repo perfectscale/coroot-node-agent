@@ -6,7 +6,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/gpu"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -28,24 +27,34 @@ type Process struct {
 	Pid       uint32
 	StartedAt time.Time
 
+	Flags proc.Flags
+
 	netNsId string
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 
+	tracer        *ebpftracer.Tracer
 	dotNetMonitor *DotNetMonitor
 	isGolangApp   bool
+	isRustApp     bool
 
-	uprobes               []link.Link
+	uprobeKeys            []ebpftracer.UprobeKey
 	goTlsUprobesChecked   bool
 	openSslUprobesChecked bool
+	rustlsUprobesChecked  bool
+	javaTlsUprobesChecked bool
 	pythonGilChecked      bool
+	nodejsChecked         bool
+	nodejsPrevStats       *ebpftracer.NodejsStats
+	pythonPrevStats       *ebpftracer.PythonStats
 
 	gpuUsageSamples []gpu.ProcessUsageSample
 }
 
 func NewProcess(pid uint32, stats *taskstats.Stats, tracer *ebpftracer.Tracer) *Process {
-	p := &Process{Pid: pid, StartedAt: stats.BeginTime}
+	p := &Process{Pid: pid, StartedAt: stats.BeginTime, tracer: tracer}
+	p.Flags, _ = proc.GetFlags(pid)
 	p.ctx, p.cancelFunc = context.WithCancel(context.Background())
 	go p.instrument(tracer)
 	return p
@@ -81,6 +90,7 @@ func (p *Process) instrument(tracer *ebpftracer.Tracer) {
 			cmdline := proc.GetCmdline(p.Pid)
 			if dest != "/" && len(cmdline) > 0 {
 				p.instrumentPython(cmdline, tracer)
+				p.instrumentNodejs(dest, tracer)
 				if dotNetAppName, err := dotNetApp(cmdline, p.Pid); err == nil {
 					if dotNetAppName != "" {
 						p.dotNetMonitor = NewDotNetMonitor(p.ctx, p.Pid, dotNetAppName)
@@ -103,11 +113,32 @@ func (p *Process) instrumentPython(cmdline []byte, tracer *ebpftracer.Tracer) {
 	if len(cmd) == 0 {
 		return
 	}
-	cmd = bytes.TrimSuffix(bytes.Fields(cmd)[0], []byte{':'})
+	cmdFields := bytes.Fields(cmd)
+	if len(cmdFields) == 0 {
+		return
+	}
+	cmd = bytes.TrimSuffix(cmdFields[0], []byte{':'})
 	if !pythonCmd.Match(cmd) {
 		return
 	}
-	p.uprobes = append(p.uprobes, tracer.AttachPythonThreadLockProbes(p.Pid)...)
+	if key := tracer.AttachPythonThreadLockProbes(p.Pid); key != nil {
+		p.pythonPrevStats = &ebpftracer.PythonStats{}
+		p.uprobeKeys = append(p.uprobeKeys, *key)
+	}
+}
+
+func (p *Process) instrumentNodejs(exe string, tracer *ebpftracer.Tracer) {
+	if p.nodejsChecked {
+		return
+	}
+	p.nodejsChecked = true
+	if !nodejsCmd.MatchString(exe) {
+		return
+	}
+	if key := tracer.AttachNodejsProbes(p.Pid, exe); key != nil {
+		p.nodejsPrevStats = &ebpftracer.NodejsStats{}
+		p.uprobeKeys = append(p.uprobeKeys, *key)
+	}
 }
 
 func (p *Process) addGpuUsageSample(sample gpu.ProcessUsageSample) {
@@ -149,7 +180,8 @@ func (p *Process) removeOldGpuUsageSamples(cutoff time.Time) {
 
 func (p *Process) Close() {
 	p.cancelFunc()
-	for _, u := range p.uprobes {
-		_ = u.Close()
+	if len(p.uprobeKeys) > 0 {
+		p.tracer.ReleaseGlobalUprobes(p.uprobeKeys)
+		p.uprobeKeys = nil
 	}
 }

@@ -14,6 +14,7 @@
 #define PROTOCOL_DNS        13
 #define PROTOCOL_CLICKHOUSE 14
 #define PROTOCOL_ZOOKEEPER  15
+#define PROTOCOL_FOUNDATIONDB 16
 
 #define STATUS_UNKNOWN  0
 #define STATUS_OK       200
@@ -56,6 +57,7 @@
 #include "dns.c"
 #include "clickhouse.c"
 #include "zookeeper.c"
+#include "foundationdb.c"
 
 struct l7_event {
     __u64 fd;
@@ -97,6 +99,50 @@ struct {
     __uint(value_size, sizeof(struct read_args));
     __uint(max_entries, 10240);
 } active_reads SEC(".maps");
+
+struct ssl_args {
+    char *buf;
+    __u64 size;
+    __u64 fd;
+    __u64 *ret_ptr;
+    __u8 is_read;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(__u64));
+    __uint(value_size, sizeof(struct ssl_args));
+    __uint(max_entries, 10240);
+} ssl_pending SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(__u64));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 10240);
+} rustls_last_read_fd SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(__u64));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 10240);
+} java_tls_last_read_fd SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(__u64));
+    __uint(value_size, sizeof(struct ssl_args));
+    __uint(max_entries, 10240);
+} rustls_write_pending SEC(".maps");
+
+#if defined(__TARGET_ARCH_x86)
+#define RUSTLS_RET_IS_OK(x) (PT_REGS_RC(x) == 0)
+#define RUSTLS_RET_SIZE(x) ((x)->dx)
+#elif defined(__TARGET_ARCH_arm64)
+#define RUSTLS_RET_IS_OK(x) (PT_REGS_RC(x) == 0)
+#define RUSTLS_RET_SIZE(x) (((PT_REGS_ARM64 *)(x))->regs[1])
+#endif
 
 struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -177,6 +223,16 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
 static inline __attribute__((__always_inline__))
 int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, __u64 iovlen) {
     __u64 id = bpf_get_current_pid_tgid();
+    char *plain_buf = 0;
+    __u64 plain_size = 0;
+    if (!is_tls) {
+        struct ssl_args *rw = bpf_map_lookup_elem(&rustls_write_pending, &id);
+        if (rw) {
+            plain_buf = rw->buf;
+            plain_size = rw->size;
+            bpf_map_delete_elem(&rustls_write_pending, &id);
+        }
+    }
     __u32 zero = 0;
     struct connection_id cid = {};
     cid.pid = id >> 32;
@@ -203,6 +259,12 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
 
     if (!is_tls) {
         __sync_fetch_and_add(&conn->bytes_sent, total_size);
+    }
+
+    if (plain_buf) {
+        payload = plain_buf;
+        size = plain_size;
+        is_tls = 1;
     }
 
     struct l7_request *req = bpf_map_lookup_elem(&l7_request_heap, &zero);
@@ -302,6 +364,8 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         req->protocol = PROTOCOL_DUBBO2;
     } else if (is_dns_request(payload, size, &k.stream_id)) {
         req->protocol = PROTOCOL_DNS;
+    } else if (is_foundationdb_request(payload, size)) {
+        req->protocol = PROTOCOL_FOUNDATIONDB;
     }
 
     if (req->protocol == PROTOCOL_UNKNOWN) {
@@ -317,6 +381,13 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
 
 static inline __attribute__((__always_inline__))
 int trace_enter_read(__u64 id, __u32 pid, __u64 fd, char *buf, __u64 *ret, __u64 iovlen) {
+    if (bpf_map_lookup_elem(&rustls_pids, &pid)) {
+        bpf_map_update_elem(&rustls_last_read_fd, &id, &fd, BPF_ANY);
+    }
+    if (bpf_map_lookup_elem(&java_tls_pids, &pid)) {
+        bpf_map_update_elem(&java_tls_last_read_fd, &id, &fd, BPF_ANY);
+    }
+
     struct connection_id cid = {};
     cid.pid = pid;
     cid.fd = fd;
@@ -484,6 +555,11 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         }
     } else if (e->protocol == PROTOCOL_DUBBO2) {
         response = is_dubbo2_response(payload, &e->status);
+    } else if (e->protocol == PROTOCOL_FOUNDATIONDB) {
+        response = is_foundationdb_response(payload, ret, &e->status);
+        if (response == 2) { // partial
+            return 0; // keeping the query in the map
+        }
     }
     bpf_map_delete_elem(&active_l7_requests, &k);
     if (!response) {
@@ -494,18 +570,64 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     return 0;
 }
 
+static inline __attribute__((__always_inline__))
+int ssl_check_write(__u64 tid, void *ctx, __u64 fd) {
+    struct ssl_args *args = bpf_map_lookup_elem(&ssl_pending, &tid);
+    if (!args || args->is_read) {
+        return -1;
+    }
+    char *buf = args->buf;
+    __u64 size = args->size;
+    bpf_map_delete_elem(&ssl_pending, &tid);
+    return trace_enter_write(ctx, fd, 1, buf, size, 0);
+}
+
+static inline __attribute__((__always_inline__))
+int ssl_check_read_enter(__u64 tid, __u64 fd) {
+    struct ssl_args *args = bpf_map_lookup_elem(&ssl_pending, &tid);
+    if (!args || !args->is_read) {
+        return -1;
+    }
+    if (!args->fd) {
+        args->fd = fd;
+        return 0;
+    }
+    return -1;
+}
+
+static inline __attribute__((__always_inline__))
+int ssl_check_read_exit(__u64 tid) {
+    struct ssl_args *args = bpf_map_lookup_elem(&ssl_pending, &tid);
+    if (!args || !args->is_read) {
+        return -1;
+    }
+    return 0;
+}
+
 SEC("tracepoint/syscalls/sys_enter_write")
 int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+    __u64 tid = bpf_get_current_pid_tgid();
+    if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
+        return 0;
+    }
     return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, ctx->size, 0);
 }
 
 SEC("tracepoint/syscalls/sys_enter_writev")
 int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+    __u64 tid = bpf_get_current_pid_tgid();
+    if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
+        return 0;
+    }
     return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, 0, ctx->size);
 }
 
 SEC("tracepoint/syscalls/sys_enter_sendmsg")
 int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+    __u64 tid = bpf_get_current_pid_tgid();
+    if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
+        return 0;
+    }
     struct user_msghdr msghdr = {};
     if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
         return 0;
@@ -520,6 +642,10 @@ struct mmsghdr {
 
 SEC("tracepoint/syscalls/sys_enter_sendmmsg")
 int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+    __u64 tid = bpf_get_current_pid_tgid();
+    if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
+        return 0;
+    }
     __u64 offset = 0;
     #pragma unroll
     for (int i = 0; i <= 1; i++) {
@@ -538,12 +664,19 @@ int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_sendto")
 int sys_enter_sendto(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+    __u64 tid = bpf_get_current_pid_tgid();
+    if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
+        return 0;
+    }
     return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, ctx->size, 0);
 }
 
 SEC("tracepoint/syscalls/sys_enter_read")
 int sys_enter_read(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
+    if (ssl_check_read_enter(id, ctx->fd) >= 0) {
+        return 0;
+    }
     __u32 pid = id >> 32;
     return trace_enter_read(id, pid, ctx->fd, ctx->buf, 0, 0);
 }
@@ -551,6 +684,9 @@ int sys_enter_read(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_readv")
 int sys_enter_readv(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
+    if (ssl_check_read_enter(id, ctx->fd) >= 0) {
+        return 0;
+    }
     __u32 pid = id >> 32;
     return trace_enter_read(id, pid, ctx->fd, ctx->buf, 0, ctx->size);
 }
@@ -558,6 +694,9 @@ int sys_enter_readv(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_recvmsg")
 int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
+    if (ssl_check_read_enter(id, ctx->fd) >= 0) {
+        return 0;
+    }
     struct user_msghdr msghdr = {};
     if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
         return 0;
@@ -569,6 +708,9 @@ int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_recvfrom")
 int sys_enter_recvfrom(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
+    if (ssl_check_read_enter(id, ctx->fd) >= 0) {
+        return 0;
+    }
     __u32 pid = id >> 32;
     return trace_enter_read(id, pid, ctx->fd, ctx->buf, 0, 0);
 }
@@ -576,6 +718,9 @@ int sys_enter_recvfrom(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_exit_read")
 int sys_exit_read(struct trace_event_raw_sys_exit__stub* ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (ssl_check_read_exit(pid_tgid) >= 0) {
+        return 0;
+    }
     __u32 pid = pid_tgid >> 32;
     return trace_exit_read(ctx, pid_tgid, pid, 0, ctx->ret);
 }
@@ -583,6 +728,9 @@ int sys_exit_read(struct trace_event_raw_sys_exit__stub* ctx) {
 SEC("tracepoint/syscalls/sys_exit_readv")
 int sys_exit_readv(struct trace_event_raw_sys_exit__stub* ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (ssl_check_read_exit(pid_tgid) >= 0) {
+        return 0;
+    }
     __u32 pid = pid_tgid >> 32;
     return trace_exit_read(ctx, pid_tgid, pid, 0, ctx->ret);
 }
@@ -590,6 +738,9 @@ int sys_exit_readv(struct trace_event_raw_sys_exit__stub* ctx) {
 SEC("tracepoint/syscalls/sys_exit_recvmsg")
 int sys_exit_recvmsg(struct trace_event_raw_sys_exit__stub* ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (ssl_check_read_exit(pid_tgid) >= 0) {
+        return 0;
+    }
     __u32 pid = pid_tgid >> 32;
     return trace_exit_read(ctx, pid_tgid, pid, 0, ctx->ret);
 }
@@ -597,6 +748,9 @@ int sys_exit_recvmsg(struct trace_event_raw_sys_exit__stub* ctx) {
 SEC("tracepoint/syscalls/sys_exit_recvfrom")
 int sys_exit_recvfrom(struct trace_event_raw_sys_exit__stub* ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (ssl_check_read_exit(pid_tgid) >= 0) {
+        return 0;
+    }
     __u32 pid = pid_tgid >> 32;
     return trace_exit_read(ctx, pid_tgid, pid, 0, ctx->ret);
 }

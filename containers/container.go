@@ -12,6 +12,7 @@ import (
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/coroot/coroot-node-agent/jvm"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/node"
 	"github.com/coroot/coroot-node-agent/pinger"
@@ -39,16 +40,16 @@ type ContainerNetwork struct {
 }
 
 type ContainerMetadata struct {
-	name               string
-	labels             map[string]string
-	volumes            map[string]string
-	logPath            string
-	image              string
-	logDecoder         logparser.Decoder
-	hostListens        map[string][]netaddr.IPPort
-	networks           map[string]ContainerNetwork
-	env                map[string]string
-	systemdTriggeredBy string
+	name        string
+	labels      map[string]string
+	volumes     map[string]string
+	logPath     string
+	image       string
+	logDecoder  logparser.Decoder
+	hostListens map[string][]netaddr.IPPort
+	networks    map[string]ContainerNetwork
+	env         map[string]string
+	systemd     SystemdProperties
 }
 
 type Delays struct {
@@ -120,7 +121,6 @@ type Container struct {
 
 	delays      Delays
 	delaysByPid map[uint32]Delays
-	delaysLock  sync.Mutex
 
 	listens map[netaddr.IPPort]map[uint32]*ListenDetails
 
@@ -135,8 +135,9 @@ type Container struct {
 
 	gpuStats map[string]*GpuUsage
 
-	oomKills                 int
-	pythonThreadLockWaitTime time.Duration
+	oomKills    int
+	nodejsStats *ebpftracer.NodejsStats
+	pythonStats *ebpftracer.PythonStats
 
 	mounts     map[string]proc.MountInfo
 	seenMounts map[uint64]struct{}
@@ -147,7 +148,7 @@ type Container struct {
 
 	registry *Registry
 
-	lock sync.RWMutex
+	lock sync.Mutex
 
 	done chan struct{}
 }
@@ -232,13 +233,13 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
-	c.registry.updateTrafficStatsIfNecessary()
+	c.registry.updateStatsFromEbpfMapsIfNecessary()
 
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+	c.lock.Lock()
+	defer c.lock.Unlock()
 
-	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
-		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
+	if c.metadata.image != "" || !c.metadata.systemd.IsEmpty() {
+		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
 	}
 
 	ch <- counter(metrics.Restarts, float64(c.restarts))
@@ -263,6 +264,15 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if s.Limit > 0 {
 			ch <- gauge(metrics.MemoryLimit, float64(s.Limit))
 		}
+	}
+
+	if psi := c.cgroup.PSI(); psi != nil {
+		ch <- counter(metrics.PsiCPU, psi.CPUSecondsSome, "some")
+		ch <- counter(metrics.PsiCPU, psi.CPUSecondsFull, "full")
+		ch <- counter(metrics.PsiMemory, psi.MemorySecondsSome, "some")
+		ch <- counter(metrics.PsiMemory, psi.MemorySecondsFull, "full")
+		ch <- counter(metrics.PsiIO, psi.IOSecondsSome, "some")
+		ch <- counter(metrics.PsiIO, psi.IOSecondsFull, "full")
 	}
 
 	if c.oomKills > 0 {
@@ -358,6 +368,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if process.isGolangApp {
 			appTypes["golang"] = struct{}{}
 		}
+		if process.isRustApp {
+			appTypes["rust"] = struct{}{}
+		}
 		switch {
 		case proc.IsJvm(cmdline):
 			jvmParams := ParseJVMParams(pid)
@@ -400,8 +413,11 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for appType := range appTypes {
 		ch <- gauge(metrics.ApplicationType, 1, appType)
 	}
-	if c.pythonThreadLockWaitTime > 0 {
-		ch <- counter(metrics.PythonThreadLockWaitTime, c.pythonThreadLockWaitTime.Seconds())
+	if c.pythonStats != nil {
+		ch <- counter(metrics.PythonThreadLockWaitTime, c.pythonStats.ThreadLockWaitTime.Seconds())
+	}
+	if c.nodejsStats != nil {
+		ch <- counter(metrics.NodejsEventLoopBlockedTime, c.nodejsStats.EventLoopBlockedTime.Seconds())
 	}
 
 	if c.dnsStats.Requests != nil {
@@ -717,7 +733,17 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey)
 
-	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
+	ebpfTracesDisabled := false
+	for _, p := range c.processes {
+		if p.Flags.EbpfTracesDisabled {
+			ebpfTracesDisabled = true
+			break
+		}
+	}
+	var trace *tracing.Trace
+	if !ebpfTracesDisabled {
+		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
+	}
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		method, path := l7.ParseHttp(r.Payload)
@@ -732,8 +758,12 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		requests := conn.http2Parser.Parse(r.Method, r.Payload, uint64(r.Duration))
 		for _, req := range requests {
 			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
-				stats.observe(req.Status.Http(), "", req.Duration)
-				trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.Duration)
+				status := req.Status.Http()
+				if req.GrpcStatus >= 0 {
+					status = req.GrpcStatus.GRPC()
+				}
+				stats.observe(status, "", req.Duration)
+				trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration)
 			}
 		}
 	case l7.ProtocolPostgres:
@@ -780,6 +810,8 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		stats.observe(r.Status.Zookeeper(), "", r.Duration)
 		op, arg := l7.ParseZookeeper(r.Payload)
 		trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
+	case l7.ProtocolFoundationDB:
+		stats.observe(r.Status.String(), "", r.Duration)
 	}
 	return nil
 }
@@ -801,8 +833,6 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 }
 
 func (c *Container) updateDelays() {
-	c.delaysLock.Lock()
-	defer c.delaysLock.Unlock()
 	for pid := range c.processes {
 		stats, err := TaskstatsTGID(pid)
 		if err != nil {
@@ -815,6 +845,40 @@ func (c *Container) updateDelays() {
 		d.disk = stats.BlockIODelay
 		c.delaysByPid[pid] = d
 	}
+}
+
+func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	p := c.processes[s.Pid]
+	if p == nil || p.nodejsPrevStats == nil {
+		return
+	}
+	if delta := s.Stats.EventLoopBlockedTime - p.nodejsPrevStats.EventLoopBlockedTime; delta > 0 {
+		if c.nodejsStats == nil {
+			c.nodejsStats = &ebpftracer.NodejsStats{}
+		}
+		c.nodejsStats.EventLoopBlockedTime += delta
+	}
+	p.nodejsPrevStats = &s.Stats
+}
+
+func (c *Container) updatePythonStats(s PythonStatsUpdate) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	p := c.processes[s.Pid]
+	if p == nil || p.pythonPrevStats == nil {
+		return
+	}
+	if delta := s.Stats.ThreadLockWaitTime - p.pythonPrevStats.ThreadLockWaitTime; delta > 0 {
+		if c.pythonStats == nil {
+			c.pythonStats = &ebpftracer.PythonStats{}
+		}
+		c.pythonStats.ThreadLockWaitTime += delta
+	}
+	p.pythonPrevStats = &s.Stats
 }
 
 func (c *Container) getMounts() map[string]map[string]*proc.FSStat {
@@ -983,6 +1047,13 @@ func (c *Container) runLogParser(logPath string) {
 		return
 	}
 
+	for _, p := range c.processes {
+		if p.Flags.LogMonitoringDisabled {
+			klog.InfoS("skipping log monitoring due to COROOT_LOG_MONITORING=disabled", "cg", c.cgroup.Id)
+			return
+		}
+	}
+
 	containerId := string(c.id)
 
 	if logPath != "" {
@@ -990,7 +1061,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1005,13 +1076,13 @@ func (c *Container) runLogParser(logPath string) {
 	switch c.cgroup.ContainerType {
 	case cgroup.ContainerTypeSystemdService:
 		ch := make(chan logparser.LogEntry)
-		if err := JournaldSubscribe(c.cgroup, ch); err != nil {
+		if err := JournaldSubscribe(c.metadata.systemd.Unit, ch); err != nil {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer)
 		stop := func() {
-			JournaldUnsubscribe(c.cgroup)
+			JournaldUnsubscribe(c.metadata.systemd.Unit)
 		}
 		klog.InfoS("started journald logparser", "cg", c.cgroup.Id)
 		c.logParsers["journald"] = &LogParser{parser: parser, stop: stop}
@@ -1025,7 +1096,7 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1172,14 +1243,38 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 		return
 	}
 	if !p.openSslUprobesChecked {
-		p.uprobes = append(p.uprobes, tracer.AttachOpenSslUprobes(pid)...)
+		if key := tracer.AttachOpenSslUprobes(pid); key != nil {
+			p.uprobeKeys = append(p.uprobeKeys, *key)
+		}
 		p.openSslUprobesChecked = true
 	}
 	if !p.goTlsUprobesChecked {
-		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
+		key, isGolangApp := tracer.AttachGoTlsUprobes(pid)
 		p.isGolangApp = isGolangApp
-		p.uprobes = append(p.uprobes, uprobes...)
+		if key != nil {
+			p.uprobeKeys = append(p.uprobeKeys, *key)
+		}
 		p.goTlsUprobesChecked = true
+	}
+	if !p.rustlsUprobesChecked {
+		key, isRustApp := tracer.AttachRustlsUprobes(pid)
+		p.isRustApp = isRustApp
+		if key != nil {
+			p.uprobeKeys = append(p.uprobeKeys, *key)
+		}
+		p.rustlsUprobesChecked = true
+	}
+	if !p.javaTlsUprobesChecked {
+		p.javaTlsUprobesChecked = true
+		if jvm.IsJavaProcess(pid) {
+			if !*flags.EnableJavaTls {
+				klog.Infof("pid=%d: Java process detected, but Java TLS instrumentation is disabled (use --enable-java-tls to enable)", pid)
+			} else if nativeLibPath := jvm.EnsureTlsAgentLoaded(pid); nativeLibPath != "" {
+				if key := tracer.AttachJavaTlsUprobes(pid, nativeLibPath); key != nil {
+					p.uprobeKeys = append(p.uprobeKeys, *key)
+				}
+			}
+		}
 	}
 }
 

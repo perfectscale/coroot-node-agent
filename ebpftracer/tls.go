@@ -2,21 +2,13 @@ package ebpftracer
 
 import (
 	"bufio"
-	"bytes"
 	"debug/buildinfo"
-	"debug/elf"
-	"errors"
-	"fmt"
-	"io"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/proc"
-	"golang.org/x/arch/arm64/arm64asm"
-	"golang.org/x/arch/x86/x86asm"
 	"k8s.io/klog/v2"
 )
 
@@ -25,129 +17,138 @@ const (
 	goTlsReadSymbol  = "crypto/tls.(*Conn).Read"
 )
 
-var (
-	opensslVersionRe = regexp.MustCompile(`OpenSSL\s(\d\.\d+\.\d+)`)
-)
+var silentErrors = []string{
+	"not a Go executable",
+	"not found",
+	"no such file or directory",
+	"no such process",
+	"permission denied",
+}
 
-func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
-	if t.disableL7Tracing {
-		return nil
-	}
-	libPath, version := getSslLibPathAndVersion(pid)
-	if libPath == "" || version == "" {
-		return nil
-	}
-
-	log := func(msg string, err error) {
+func uprobeLog(pid uint32, prefix string) func(string, error) {
+	return func(msg string, err error) {
 		if err != nil {
-			for _, s := range []string{"no such file or directory", "no such process", "permission denied"} {
+			for _, s := range silentErrors {
 				if strings.HasSuffix(err.Error(), s) {
 					return
 				}
 			}
-			klog.ErrorfDepth(1, "pid=%d libssl_version=%s: %s: %s", pid, version, msg, err)
+			klog.ErrorfDepth(2, "pid=%d%s: %s: %s", pid, prefix, msg, err)
 			return
 		}
-		klog.InfofDepth(1, "pid=%d libssl_version=%s: %s", pid, version, msg)
+		klog.InfofDepth(2, "pid=%d%s: %s", pid, prefix, msg)
 	}
+}
 
-	exe, err := link.OpenExecutable(libPath)
+type uprobeSpec struct {
+	symbol    string
+	uprobe    string
+	uretprobe string
+	optional  bool
+}
+
+func (t *Tracer) attachUprobes(exePath string, ef *ELFFile, specs []uprobeSpec, log func(string, error)) []link.Link {
+	exe, err := link.OpenExecutable(exePath)
 	if err != nil {
 		log("failed to open executable", err)
 		return nil
 	}
 	var links []link.Link
-	writeEnter := "openssl_SSL_write_enter"
-	readEnter := "openssl_SSL_read_enter"
-	readExEnter := "openssl_SSL_read_ex_enter"
-	readExit := "openssl_SSL_read_exit"
-	v, err := common.VersionFromString(version)
-	if err != nil {
-		log("failed to determine version", err)
-		return nil
+	closeLinks := func() {
+		for _, l := range links {
+			l.Close()
+		}
 	}
-	switch {
-	case v.GreaterOrEqual(common.NewVersion(3, 0, 0)):
-		writeEnter = "openssl_SSL_write_enter_v3_0"
-		readEnter = "openssl_SSL_read_enter_v3_0"
-		readExEnter = "openssl_SSL_read_ex_enter_v3_0"
-	case v.GreaterOrEqual(common.NewVersion(1, 1, 1)):
-		writeEnter = "openssl_SSL_write_enter_v1_1_1"
-		readEnter = "openssl_SSL_read_enter_v1_1_1"
-		readExEnter = "openssl_SSL_read_ex_enter_v1_1_1"
-	}
-
-	type prog struct {
-		symbol    string
-		uprobe    string
-		uretprobe string
-	}
-	progs := []prog{
-		{symbol: "SSL_write", uprobe: writeEnter},
-		{symbol: "SSL_read", uprobe: readEnter},
-		{symbol: "SSL_read", uretprobe: readExit},
-	}
-	if v.GreaterOrEqual(common.NewVersion(1, 1, 1)) {
-		progs = append(progs, []prog{
-			{symbol: "SSL_write_ex", uprobe: writeEnter},
-			{symbol: "SSL_read_ex", uprobe: readExEnter},
-			{symbol: "SSL_read_ex", uretprobe: readExit},
-		}...)
-	}
-	for _, p := range progs {
-		if p.uprobe != "" {
-			l, err := exe.Uprobe(p.symbol, t.uprobes[p.uprobe], nil)
+	for _, s := range specs {
+		sym, err := ef.GetSymbol(s.symbol)
+		if err != nil {
+			if s.optional {
+				continue
+			}
+			log("failed to get symbol "+s.symbol, err)
+			closeLinks()
+			return nil
+		}
+		if s.uprobe != "" {
+			l, err := sym.AttachUprobe(exe, t.uprobes[s.uprobe], 0)
 			if err != nil {
-				log("failed to attach uprobe", err)
+				log("failed to attach uprobe "+s.uprobe, err)
+				closeLinks()
 				return nil
 			}
 			links = append(links, l)
 		}
-		if p.uretprobe != "" {
-			l, err := exe.Uretprobe(p.symbol, t.uprobes[p.uretprobe], nil)
+		if s.uretprobe != "" {
+			ls, err := sym.AttachUretprobes(exe, t.uprobes[s.uretprobe], 0)
+			links = append(links, ls...)
 			if err != nil {
-				log("failed to attach uretprobe", err)
+				log("failed to attach uretprobe "+s.uretprobe, err)
+				closeLinks()
 				return nil
 			}
-			links = append(links, l)
 		}
 	}
-
-	log("libssl uprobes attached", nil)
 	return links
 }
 
-func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
+func (t *Tracer) AttachOpenSslUprobes(pid uint32) *UprobeKey {
+	if t.disableL7Tracing {
+		return nil
+	}
+	libPath := getSslLibPath(pid)
+	if libPath == "" {
+		return nil
+	}
+	log := uprobeLog(pid, "")
+	key, ok := t.AcquireGlobalUprobe(libPath, func() []link.Link {
+		ef, err := OpenELFFile(libPath)
+		if err != nil {
+			log("open elf", err)
+			return nil
+		}
+		defer ef.Close()
+
+		links := t.attachUprobes(libPath, ef, []uprobeSpec{
+			{symbol: "SSL_write", uprobe: "openssl_SSL_write_enter"},
+			{symbol: "SSL_read", uprobe: "openssl_SSL_read_enter"},
+			{symbol: "SSL_read", uretprobe: "openssl_SSL_read_exit"},
+			{symbol: "SSL_write_ex", uprobe: "openssl_SSL_write_enter", optional: true},
+			{symbol: "SSL_read_ex", uprobe: "openssl_SSL_read_ex_enter", optional: true},
+			{symbol: "SSL_read_ex", uretprobe: "openssl_SSL_read_exit", optional: true},
+		}, log)
+		if len(links) > 0 {
+			log("libssl uprobes attached (global)", nil)
+		}
+		return links
+	})
+	if ok {
+		return &key
+	}
+	return nil
+}
+
+func (t *Tracer) AttachGoTlsUprobes(pid uint32) (*UprobeKey, bool) {
 	isGolangApp := false
 	if t.disableL7Tracing {
 		return nil, isGolangApp
 	}
 
-	path := proc.Path(pid, "exe")
+	exePath := proc.Path(pid, "exe")
 
-	var err error
 	var name, version string
 	log := func(msg string, err error) {
-		if err != nil {
-			for _, s := range []string{"not a Go executable", "no such file or directory", "no such process", "permission denied"} {
-				if strings.HasSuffix(err.Error(), s) {
-					return
-				}
-			}
-			klog.ErrorfDepth(1, "pid=%d golang_app=%s golang_version=%s: %s: %s", pid, name, version, msg, err)
-			return
-		}
-		klog.InfofDepth(1, "pid=%d golang_app=%s golang_version=%s: %s", pid, name, version, msg)
+		prefix := " golang_app=" + name + " golang_version=" + version
+		uprobeLog(pid, prefix)(msg, err)
 	}
 
-	bi, err := buildinfo.ReadFile(path)
+	bi, err := buildinfo.ReadFile(exePath)
 	if err != nil {
 		log("failed to read build info", err)
 		return nil, isGolangApp
 	}
 	isGolangApp = true
 
-	name, err = os.Readlink(path)
+	name, err = os.Readlink(exePath)
 	if err != nil {
 		log("failed to read name", err)
 		return nil, isGolangApp
@@ -162,191 +163,160 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		return nil, isGolangApp
 	}
 
-	ef, err := elf.Open(path)
+	key, ok := t.AcquireGlobalUprobe(proc.Path(pid, "root", name), func() []link.Link {
+		ef, err := OpenELFFile(exePath)
+		if err != nil {
+			log("failed to open as elf binary", err)
+			return nil
+		}
+		defer ef.Close()
+
+		links := t.attachUprobes(exePath, ef, []uprobeSpec{
+			{symbol: goTlsWriteSymbol, uprobe: "go_crypto_tls_write_enter"},
+			{symbol: goTlsReadSymbol, uprobe: "go_crypto_tls_read_enter"},
+			{symbol: goTlsReadSymbol, uretprobe: "go_crypto_tls_read_exit"},
+		}, log)
+		if len(links) > 0 {
+			log("crypto/tls uprobes attached", nil)
+		}
+		return links
+	})
+	if ok {
+		return &key, isGolangApp
+	}
+	return nil, isGolangApp
+}
+
+func (t *Tracer) AttachRustlsUprobes(pid uint32) (*UprobeKey, bool) {
+	isRustApp := false
+	if t.disableL7Tracing {
+		return nil, isRustApp
+	}
+
+	exePath := proc.Path(pid, "exe")
+	log := uprobeLog(pid, "")
+
+	ef, err := OpenELFFile(exePath)
 	if err != nil {
-		log("failed to open as elf binary", err)
-		return nil, isGolangApp
+		return nil, isRustApp
 	}
 	defer ef.Close()
 
-	symbols, err := ef.Symbols()
+	if !ef.IsRustBinary() {
+		return nil, isRustApp
+	}
+	isRustApp = true
+
+	name, err := os.Readlink(exePath)
 	if err != nil {
-		if errors.Is(err, elf.ErrNoSymbols) {
-			log("no symbol section", nil)
-			return nil, isGolangApp
-		}
-		log("failed to read symbols", err)
-		return nil, isGolangApp
+		log("failed to read name", err)
+		return nil, isRustApp
 	}
 
-	textSection := ef.Section(".text")
-	if textSection == nil {
-		log("no text section", nil)
-		return nil, isGolangApp
-	}
-	textReader := textSection.Open()
-
-	exe, err := link.OpenExecutable(path)
-	if err != nil {
-		log("failed to open executable", err)
-		return nil, isGolangApp
+	writerWrite := ef.FindSymbolBySubstrings("rustls", "Writer", "write")
+	if writerWrite == nil {
+		return nil, isRustApp
 	}
 
-	var links []link.Link
-	for _, s := range symbols {
-		if elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Size == 0 {
-			continue
-		}
-		switch s.Name {
-		case goTlsWriteSymbol, goTlsReadSymbol:
-		default:
-			continue
-		}
-		address := s.Value
-		for _, p := range ef.Progs {
-			if p.Type != elf.PT_LOAD || (p.Flags&elf.PF_X) == 0 {
-				continue
-			}
+	readerRead := ef.FindSymbolBySubstrings("rustls", "Reader", "read")
+	if readerRead == nil {
+		return nil, isRustApp
+	}
 
-			if p.Vaddr <= s.Value && s.Value < (p.Vaddr+p.Memsz) {
-				address = s.Value - p.Vaddr + p.Off
-				break
+	key, ok := t.AcquireGlobalUprobe(proc.Path(pid, "root", name), func() []link.Link {
+		exe, err := link.OpenExecutable(exePath)
+		if err != nil {
+			log("failed to open executable", err)
+			return nil
+		}
+		var links []link.Link
+		closeLinks := func() {
+			for _, l := range links {
+				l.Close()
 			}
 		}
-		switch s.Name {
-		case goTlsWriteSymbol:
-			l, err := exe.Uprobe(s.Name, t.uprobes["go_crypto_tls_write_enter"], &link.UprobeOptions{Address: address})
-			if err != nil {
-				log("failed to attach write_enter uprobe", err)
-				return nil, isGolangApp
-			}
-			links = append(links, l)
-		case goTlsReadSymbol:
-			l, err := exe.Uprobe(s.Name, t.uprobes["go_crypto_tls_read_enter"], &link.UprobeOptions{Address: address})
-			if err != nil {
-				log("failed to attach read_enter uprobe", err)
-				return nil, isGolangApp
-			}
-			links = append(links, l)
-			sStart := s.Value - textSection.Addr
-			_, err = textReader.Seek(int64(sStart), io.SeekStart)
-			if err != nil {
-				log("failed to seek", err)
-				return nil, isGolangApp
-			}
-			sBytes := make([]byte, s.Size)
-			_, err = textReader.Read(sBytes)
-			if err != nil {
-				log("failed to read", err)
-				return nil, isGolangApp
-			}
-			returnOffsets := getReturnOffsets(ef.Machine, sBytes)
-			if len(returnOffsets) == 0 {
-				log("failed to attach read_exit uprobe", fmt.Errorf("no return offsets found"))
-				return nil, isGolangApp
-			}
-			for _, offset := range returnOffsets {
-				l, err := exe.Uprobe(s.Name, t.uprobes["go_crypto_tls_read_exit"], &link.UprobeOptions{Address: address, Offset: uint64(offset)})
-				if err != nil {
-					log("failed to attach read_exit uprobe", err)
-					return nil, isGolangApp
-				}
-				links = append(links, l)
-			}
+		l, err := writerWrite.AttachUprobe(exe, t.uprobes["rustls_write_enter"], 0)
+		if err != nil {
+			log("failed to attach rustls write_enter uprobe", err)
+			return nil
 		}
+		links = append(links, l)
+
+		l, err = readerRead.AttachUprobe(exe, t.uprobes["rustls_read_enter"], 0)
+		if err != nil {
+			log("failed to attach rustls read_enter uprobe", err)
+			closeLinks()
+			return nil
+		}
+		links = append(links, l)
+
+		ls, err := readerRead.AttachUretprobes(exe, t.uprobes["rustls_read_exit"], 0)
+		links = append(links, ls...)
+		if err != nil {
+			log("failed to attach rustls read_exit uprobe", err)
+			closeLinks()
+			return nil
+		}
+
+		if len(links) > 0 {
+			log("rustls uprobes attached", nil)
+		}
+		return links
+	})
+	if ok {
+		return &key, isRustApp
 	}
-	if len(links) == 0 {
-		return nil, isGolangApp
-	}
-	log("crypto/tls uprobes attached", nil)
-	return links, isGolangApp
+	return nil, isRustApp
 }
 
-func getSslLibPathAndVersion(pid uint32) (string, string) {
+func (t *Tracer) AttachJavaTlsUprobes(pid uint32, nativeLibPath string) *UprobeKey {
+	if t.disableL7Tracing {
+		return nil
+	}
+	log := uprobeLog(pid, "")
+	key, ok := t.AcquireGlobalUprobe(nativeLibPath, func() []link.Link {
+		ef, err := OpenELFFile(nativeLibPath)
+		if err != nil {
+			log("open elf", err)
+			return nil
+		}
+		defer ef.Close()
+
+		links := t.attachUprobes(nativeLibPath, ef, []uprobeSpec{
+			{symbol: "coroot_java_tls_write_enter", uprobe: "java_tls_write_enter"},
+			{symbol: "coroot_java_tls_read_exit", uprobe: "java_tls_read_exit"},
+		}, log)
+		if len(links) > 0 {
+			log("java TLS uprobes attached (global)", nil)
+		}
+		return links
+	})
+	if ok {
+		return &key
+	}
+	return nil
+}
+
+func getSslLibPath(pid uint32) string {
 	f, err := os.Open(proc.Path(pid, "maps"))
 	if err != nil {
-		return "", ""
+		return ""
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Split(bufio.ScanLines)
-	var libsslPath, libcryptoPath string
 	for scanner.Scan() {
 		parts := strings.Fields(scanner.Text())
 		if len(parts) <= 5 {
 			continue
 		}
 		libPath := parts[5]
-		switch {
-		case libsslPath == "" && strings.Contains(libPath, "libssl.so"):
+		if strings.Contains(libPath, "libssl.so") {
 			fullPath := proc.Path(pid, "root", libPath)
 			if _, err = os.Stat(fullPath); err == nil {
-				libsslPath = fullPath
+				return fullPath
 			}
-		case libcryptoPath == "" && strings.Contains(libPath, "libcrypto.so"):
-			fullPath := proc.Path(pid, "root", libPath)
-			if _, err = os.Stat(fullPath); err == nil {
-				libcryptoPath = fullPath
-			}
-		default:
-			continue
-		}
-		if libsslPath != "" && libcryptoPath != "" {
-			break
 		}
 	}
-	if libsslPath == "" || libcryptoPath == "" {
-		return "", ""
-	}
-
-	ef, err := elf.Open(libcryptoPath)
-	if err != nil {
-		return "", ""
-	}
-	defer ef.Close()
-	rodataSection := ef.Section(".rodata")
-	if rodataSection == nil {
-		return "", ""
-	}
-	rodataSectionData, err := rodataSection.Data()
-	if err != nil {
-		return "", ""
-	}
-	var version string
-	for _, b := range bytes.Split(rodataSectionData, []byte("\x00")) {
-		if len(b) == 0 {
-			continue
-		}
-		s := string(b)
-		if !strings.HasPrefix(s, "OpenSSL") {
-			continue
-		}
-		if m := opensslVersionRe.FindStringSubmatch(s); len(m) > 1 {
-			version = m[1]
-		}
-	}
-	return libsslPath, "v" + version
-}
-
-func getReturnOffsets(machine elf.Machine, instructions []byte) []int {
-	var res []int
-	switch machine {
-	case elf.EM_X86_64:
-		for i := 0; i < len(instructions); {
-			ins, err := x86asm.Decode(instructions[i:], 64)
-			if err == nil && ins.Op == x86asm.RET {
-				res = append(res, i)
-			}
-			i += ins.Len
-		}
-	case elf.EM_AARCH64:
-		for i := 0; i < len(instructions); {
-			ins, err := arm64asm.Decode(instructions[i:])
-			if err == nil && ins.Op == arm64asm.RET {
-				res = append(res, i)
-			}
-			i += 4
-		}
-	}
-	return res
+	return ""
 }
